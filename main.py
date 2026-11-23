@@ -1,116 +1,140 @@
 #!/usr/bin/env python3
-"""Deliver the front page for Monday 23 November 2026.
+"""news-image-20261123 — write the front page of Monday 23 November 2026.
 
-The entry is a single picture, ``entry.png``: a JPEG kept under the
-name the bounty asks for, 1024 by 1024 pixels, showing the day's
-world news as a newspaper front page. This program copies that
-picture, byte for byte, into the output directory, and it will not
-claim success until the copy has proved itself:
+The picture itself is shipped in this repository as ``entry.png`` (a JPEG
+despite the name, which the competition allows). This program's only job is
+to deliver that exact picture to the output folder and prove, before it
+reports success, that the delivered copy is the genuine article:
 
-- the picture is there and not empty,
-- it is no bigger than 1 MiB,
-- it starts with the JPEG opening bytes and ends with the closing
-  bytes,
-- its first frame header reads 1024 by 1024,
-- the copy matches the picture exactly.
+  * it exists and is not empty,
+  * it is no bigger than 1 MiB,
+  * it opens with the JPEG start marker (FF D8) and closes with the JPEG
+    end marker (FF D9),
+  * the dimensions read from its JPEG frame header are 1024 by 1024, and
+  * it is byte-for-byte identical to the picture shipped in this repo.
 
-Only the Python standard library is used. Nothing is fetched from
-the network, and the same input always gives the same output, so
-running the program twice writes the same bytes twice and the
-grader's two runs agree.
+Nothing is downloaded, generated or modified: the same input bytes always
+produce the same output bytes, so running the program twice writes the
+same file twice.
+
+Usage:
+    MAKEFUN_OUTPUT_DIR=out python3 main.py
+    (without MAKEFUN_OUTPUT_DIR the output folder is /output)
 """
+
+from __future__ import annotations
 
 import hashlib
 import os
-import struct
 import sys
 from pathlib import Path
 
-PICTURE = "entry.png"
-SIZE_LIMIT = 1024 * 1024
-SIDE = 1024
+# --- limits from the competition rules ------------------------------------
+MAX_BYTES = 1 * 1024 * 1024          # 1 MiB
+EXPECTED_WIDTH = 1024
+EXPECTED_HEIGHT = 1024
+JPEG_START = b"\xff\xd8"            # SOI marker
+JPEG_END = b"\xff\xd9"              # EOI marker
 
-# Start-of-frame markers whose segment carries the picture's height
-# and width as two big-endian 16-bit numbers.
-FRAME_MARKERS = {
-    0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
-    0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF,
-}
-
-
-class BadPicture(Exception):
-    """Raised when a check fails, so a bad copy is never reported."""
+SOURCE_NAME = "entry.png"           # the picture shipped beside this file
+OUTPUT_NAME = "entry.png"           # the name the judge expects in /output
 
 
-def refuse(message):
-    raise BadPicture(message)
+def fail(message: str) -> "SystemExit":
+    """Abort with a clear reason; a failed copy must never look like a win."""
+    return SystemExit(f"error: {message}")
 
 
-def read_dimensions(data):
-    """Return (width, height) from a JPEG byte string's frame header.
+def read_frame_dimensions(data: bytes) -> tuple[int, int]:
+    """Return (width, height) from the first JPEG frame (SOF) segment.
 
-    Walks the marker segments from the start of the image; the first
-    start-of-frame segment holds the height, then the width.
+    Walks the JPEG marker stream starting after the SOI marker. Standalone
+    markers (SOI, EOI, RSTn, TEM) carry no length field; every other segment
+    does, so the walk skips each segment by its declared length until it
+    reaches a Start-Of-Frame marker, whose payload stores the height then
+    the width as two big-endian 16-bit values.
     """
-    offset = 2  # skip the SOI marker
-    while offset + 9 <= len(data):
-        if data[offset] != 0xFF:
-            refuse("no marker at byte %d" % offset)
-        marker = data[offset + 1]
-        if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
-            offset += 2
+    if data[:2] != JPEG_START:
+        raise ValueError("not a JPEG: missing SOI marker (FF D8)")
+
+    pos = 2
+    while pos + 1 < len(data):
+        if data[pos] != 0xFF:
+            raise ValueError(f"bad marker byte 0x{data[pos]:02x} at offset {pos}")
+        marker = data[pos + 1]
+        pos += 2
+
+        # Markers with no payload: restart markers, SOI/EOI/TEM.
+        # Skipping them is safe: they are always exactly two bytes.
+        if marker == 0xD8 or marker == 0xD9 or marker == 0x01 or 0xD0 <= marker <= 0xD7:
             continue
-        (segment_len,) = struct.unpack(">H", data[offset + 2:offset + 4])
-        if segment_len < 2 or offset + 2 + segment_len > len(data):
-            refuse("segment at byte %d has an impossible length" % offset)
-        if marker in FRAME_MARKERS:
-            # The frame segment layout is: length (2), precision (1),
-            # height (2), width (2) — so height sits at +5, width at +7.
-            (height,) = struct.unpack(">H", data[offset + 5:offset + 7])
-            (width,) = struct.unpack(">H", data[offset + 7:offset + 9])
+
+        if pos + 2 > len(data):
+            raise ValueError("truncated segment length")
+        length = int.from_bytes(data[pos:pos + 2], "big")
+        if length < 2 or pos + length > len(data):
+            raise ValueError("segment length runs past the end of the file")
+
+        # SOF0 (baseline) and SOF2 (progressive) both carry the dimensions.
+        if marker in (0xC0, 0xC2):
+            payload = data[pos + 2:pos + length]
+            if len(payload) < 5:
+                raise ValueError("frame segment too short for dimensions")
+            height = int.from_bytes(payload[1:3], "big")
+            width = int.from_bytes(payload[3:5], "big")
             return width, height
-        offset += 2 + segment_len
-    refuse("no frame header found in the picture")
+
+        pos += length
+
+    raise ValueError("no JPEG frame (SOF) segment found")
 
 
-def main():
-    folder = Path(__file__).resolve().parent
-    source = folder / PICTURE
-    if not source.is_file():
-        refuse("picture missing: %s" % source)
-    picture = source.read_bytes()
-    if not picture:
-        refuse("the picture is empty")
-    if len(picture) > SIZE_LIMIT:
-        refuse("picture is %d bytes, over the %d-byte limit"
-               % (len(picture), SIZE_LIMIT))
-    if picture[:2] != b"\xff\xd8":
-        refuse("picture lacks the JPEG opening bytes")
-    if picture[-2:] != b"\xff\xd9":
-        refuse("picture lacks the JPEG closing bytes")
-    width, height = read_dimensions(picture)
-    if (width, height) != (SIDE, SIDE):
-        refuse("picture is %d by %d, wanted %d by %d"
-               % (width, height, SIDE, SIDE))
+def verify_copy(source: bytes, copy: bytes) -> tuple[int, int]:
+    """Check the delivered copy against every rule; return (width, height)."""
+    if not copy:
+        raise ValueError("output is empty")
+    if len(copy) > MAX_BYTES:
+        raise ValueError(f"output is {len(copy)} bytes, over the 1 MiB limit")
+    if not copy.startswith(JPEG_START):
+        raise ValueError("output does not start with the JPEG SOI marker FF D8")
+    if not copy.endswith(JPEG_END):
+        raise ValueError("output does not end with the JPEG EOI marker FF D9")
+    width, height = read_frame_dimensions(copy)
+    if (width, height) != (EXPECTED_WIDTH, EXPECTED_HEIGHT):
+        raise ValueError(
+            f"frame is {width}x{height}, expected "
+            f"{EXPECTED_WIDTH}x{EXPECTED_HEIGHT}"
+        )
+    if copy != source:
+        raise ValueError("output differs from the shipped picture")
+    return width, height
 
-    out_dir = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
-    out_dir.mkdir(parents=True, exist_ok=True)
-    target = out_dir / PICTURE
-    if target.resolve() == source.resolve():
-        refuse("output folder is the entry folder; the copy would "
-               "overwrite the picture it ships")
-    target.write_bytes(picture)
 
-    delivered = target.read_bytes()
-    if delivered != picture:
-        refuse("the copy does not match the picture byte for byte")
-    print("wrote %s (%d bytes, sha256 %s)"
-          % (target, len(delivered), hashlib.sha256(delivered).hexdigest()))
+def main() -> int:
+    here = Path(__file__).resolve().parent
+    source_path = here / SOURCE_NAME
+    if not source_path.is_file():
+        raise fail(f"shipped picture not found: {source_path}")
+
+    source = source_path.read_bytes()
+
+    output_dir = Path(os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / OUTPUT_NAME
+    output_path.write_bytes(source)
+
+    copy = output_path.read_bytes()
+    try:
+        width, height = verify_copy(source, copy)
+    except ValueError as exc:
+        output_path.unlink(missing_ok=True)
+        raise fail(str(exc))
+
+    digest = hashlib.sha256(copy).hexdigest()
+    print(f"wrote {output_path} ({len(copy)} bytes, {width}x{height} JPEG)")
+    print(f"sha256: {digest}")
+    return 0
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except BadPicture as problem:
-        sys.stderr.write("refused: %s\n" % problem)
-        sys.exit(1)
+    sys.exit(main())
